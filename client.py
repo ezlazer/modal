@@ -16,19 +16,13 @@ with open(INPUT_FILE, "rb") as f:
 # 2. Prepare Payload
 payload = {
     "image": image_b64,
-    "scale": 1,
-    "detail": 1,
-    "smooth": 5,
-    "alpha_threshold": 64,
-    "edge_erosion": 2,
-    "depth_blur": 0.5,
-    "max_depth_gradient": 0.4,
-    "edge_blend_distance": 20,
-    "extrude": True
+    "keep_background": False,   # set True to retain background (skips PhotoRoom + silhouette cut)
+    "depth_ratio": 0.30,        # Z extent as fraction of max(X,Y) extent
+    "alpha_threshold": 160,     # higher threshold excludes semi-transparent stragglers
 }
 
 # 3. Send to Modal (The URL you got from 'modal deploy')
-MODAL_URL = "https://info-38385--depth-to-glb-service-generate-3d.modal.run"
+MODAL_URL = "https://info-38385--depth-to-glb-v3-generate-3d.modal.run"
 headers = {"Authorization": "Bearer yGaiBLs46frDXusfw7aQqIOHtZVx5txA"}
 response = requests.post(MODAL_URL, json=payload, headers=headers)
 
