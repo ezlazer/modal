@@ -39,7 +39,7 @@ image = (
         "python -c 'from depth_anything_3.api import DepthAnything3; "
         f'DepthAnything3.from_pretrained("{DEPTH_MODEL_ID}")\'',
     )
-    .env({"BUILD_VERSION": "5"})
+    .env({"BUILD_VERSION": "21"})
 )
 
 app = modal.App("depth-to-glb-v3", image=image)
@@ -83,6 +83,29 @@ class Model:
         if resp.status_code != 200:
             raise RuntimeError(f"PhotoRoom API error {resp.status_code}: {resp.text}")
         return Image.open(io.BytesIO(resp.content)).convert("RGBA")
+
+    def _smooth_alpha(self, rgba_pil, sigma_px):
+        """Gaussian-blur PhotoRoom's alpha to smooth stair-step boundary noise.
+
+        PhotoRoom's segmentation is accurate but has sub-pixel jaggedness
+        along silhouettes (sawtooth pattern from the model's bilinear
+        upsampling). Binary thresholding (alpha > 160) downstream preserves
+        that jaggedness as mesh-boundary serrations. Pre-blurring the float
+        alpha pushes the binary iso-contour to the smoother gaussian-soft
+        level set — every downstream alpha read sees a smooth-bordered mask
+        for free, without extra morphology iterations to tune.
+        """
+        import numpy as np
+        from PIL import Image
+        from scipy.ndimage import gaussian_filter
+
+        if sigma_px <= 0:
+            return rgba_pil
+        arr = np.array(rgba_pil)
+        a = gaussian_filter(arr[:, :, 3].astype(np.float32), sigma=float(sigma_px))
+        arr[:, :, 3] = np.clip(a, 0, 255).astype(np.uint8)
+        print(f"Alpha smooth: sigma_px={sigma_px}")
+        return Image.fromarray(arr)
 
     def _crop_to_alpha_bbox(self, rgba_pil, alpha_threshold, padding_frac=0.02):
         """Crop RGBA to the foreground bounding box with a small padding band.
@@ -194,6 +217,104 @@ class Model:
         nearest = distance_transform_edt(invalid, return_distances=False, return_indices=True)
         return depth[tuple(nearest)]
 
+    def _suppress_dark_region_depth(self, depth, rgb_pil, mask, lum_threshold):
+        """Replace depth at dark FOREGROUND pixels with nearest reliable pixel's depth.
+
+        DA3 (and every monocular depth model) has a "dark = far" bias —
+        shadows under chins, dark cloth, cast shadows all get false-deep
+        readings even though they're at the figure's surface. Image-guided
+        smoothing can't fix this: the dark region IS a real luminance edge,
+        so the guide tells the filter "preserve the discontinuity here."
+
+        This helper sidesteps that: it identifies dark foreground pixels as
+        UNRELIABLE, then overwrites their depth with the depth of the nearest
+        reliable (bright + foreground) pixel via EDT. The V-neck dent gets
+        replaced with surrounding chest depth; the chin shadow gets replaced
+        with surrounding face depth. Bright pixels (face, polo body) are
+        untouched, so face geometry is preserved.
+        """
+        import numpy as np
+        from PIL import Image
+        from scipy.ndimage import distance_transform_edt
+
+        if lum_threshold <= 0 or mask is None or not mask.any():
+            return depth
+
+        L_pil = rgb_pil.convert("L")
+        if L_pil.size != (depth.shape[1], depth.shape[0]):
+            L_pil = L_pil.resize(
+                (depth.shape[1], depth.shape[0]), Image.BILINEAR,
+            )
+        L = np.asarray(L_pil, dtype=np.float32) / 255.0
+
+        dark = L < float(lum_threshold)
+        suspicious = dark & mask
+        if not suspicious.any():
+            print(f"Dark-region suppress: 0 dark fg pixels (lum<{lum_threshold})")
+            return depth
+
+        reliable = mask & ~dark
+        if not reliable.any():
+            print("Dark-region suppress: no reliable pixels; skipping")
+            return depth
+
+        invalid = ~reliable
+        nearest = distance_transform_edt(
+            invalid, return_distances=False, return_indices=True,
+        )
+        out = np.where(suspicious, depth[tuple(nearest)], depth)
+        n = int(suspicious.sum())
+        print(f"Dark-region suppress: {n} dark fg pixels replaced (lum<{lum_threshold})")
+        return out.astype(np.float32)
+
+    def _image_guided_depth_smooth(self, depth, rgb_pil, radius_px, eps):
+        """Edge-preserving depth smoothing guided by the RGB image (gray).
+
+        Targets monocular depth's "dark = far" artifacts: shadows, polo
+        V-necks, chin/collar recesses get false-deep readings from DA3 because
+        the network uses image luminance as a depth cue. Smoothing depth
+        within image-uniform regions (gray luminance as guide) averages those
+        spurious deep readings against neighboring skin/cloth. True geometric
+        edges (jaw, nose ridge) have RGB discontinuities and are preserved.
+
+        Pure numpy + scipy implementation of He et al. 2010 guided filter
+        (gray formulation), so we don't depend on cv2.ximgproc — opencv-contrib
+        and DA3's transitive opencv-python collide on cv2 module ownership and
+        the contrib bindings get shadowed at import time.
+        """
+        import numpy as np
+        from PIL import Image
+        from scipy.ndimage import uniform_filter
+
+        if radius_px <= 0:
+            return depth
+
+        # Build gray guide at depth resolution (BT.601 luminance, normalized).
+        guide_pil = rgb_pil.convert("L")
+        if guide_pil.size != (depth.shape[1], depth.shape[0]):
+            guide_pil = guide_pil.resize(
+                (depth.shape[1], depth.shape[0]), Image.BILINEAR,
+            )
+        I = np.asarray(guide_pil, dtype=np.float32) / 255.0
+        p = depth.astype(np.float32)
+        r = int(radius_px)
+        win = 2 * r + 1
+
+        def box(x):
+            return uniform_filter(x, size=win, mode="reflect")
+
+        mean_I = box(I)
+        mean_p = box(p)
+        corr_Ip = box(I * p)
+        corr_II = box(I * I)
+        var_I = corr_II - mean_I * mean_I
+        cov_Ip = corr_Ip - mean_I * mean_p
+        a = cov_Ip / (var_I + float(eps))
+        b = mean_p - a * mean_I
+        out = box(a) * I + box(b)
+        print(f"Image-guided depth smooth: radius={radius_px}px, eps={eps}")
+        return out.astype(np.float32)
+
     def _smooth_silhouette_edge_depth(self, depth, mask, edge_px):
         """Feather depth toward smooth body-shape at the silhouette boundary.
 
@@ -252,7 +373,7 @@ class Model:
         v = np.linspace(1.0, 0.0, height)
         uv_u, uv_v = np.meshgrid(u, v)
 
-        z = -np.clip(depth, 0.0, 1.0) * z_extent
+        z = np.clip(depth, 0.0, 1.0) * z_extent
         vertices = np.column_stack((xv.flatten(), yv.flatten(), z.flatten()))
         uvs = np.column_stack((uv_u.flatten(), uv_v.flatten()))
 
@@ -318,15 +439,18 @@ class Model:
         image_bytes,
         keep_background: bool = False,
         depth_ratio: float = 0.30,
-        alpha_threshold: int = 160,
-        silhouette_open_iters: int = 2,
-        silhouette_erode_iters: int = 2,
+        alpha_threshold: int = 128,
+        silhouette_open_iters: int = 0,
+        silhouette_erode_iters: int = 0,
         silhouette_edge_smooth_px: float = 12.0,
+        alpha_smooth_sigma_px: float = 4.0,
+        depth_smooth_radius_px: float = 8.0,
+        depth_smooth_eps: float = 0.01,
+        dark_lum_threshold: float = 0.30,
     ):
         import time
 
         import numpy as np
-        import trimesh
         import trimesh.transformations as transformations
         from PIL import Image
 
@@ -350,6 +474,13 @@ class Model:
             if rgba_full.size != (full_w, full_h):
                 rgba_full = rgba_full.resize((full_w, full_h), Image.LANCZOS)
         timings["background"] = time.time() - t
+
+        # 2a. Pre-smooth alpha to round PhotoRoom's stair-step boundary noise
+        # before any binary thresholding (bbox crop, working mask, silhouette cut).
+        if not keep_background and alpha_smooth_sigma_px > 0:
+            t = time.time()
+            rgba_full = self._smooth_alpha(rgba_full, alpha_smooth_sigma_px)
+            timings["alpha_smooth"] = time.time() - t
 
         # 2b. Crop to alpha bounding box BEFORE the working-resolution downsize.
         # Skipped when keep_background=True (no foreground to crop to). After
@@ -394,6 +525,29 @@ class Model:
             depth = self._extrapolate_to_background(depth, alpha_mask)
             timings["edt_fill"] = time.time() - t
 
+        # 4b1. Dark-region depth suppress — overwrite depth at dark FG pixels
+        # with nearest reliable (bright FG) pixel's depth. Direct fix for
+        # monocular depth's "dark = far" bias (V-neck eating, chin shadows).
+        # Must run BEFORE the guided smooth so the smooth doesn't lock in the
+        # bad values.
+        if not keep_background and dark_lum_threshold > 0:
+            t = time.time()
+            depth = self._suppress_dark_region_depth(
+                depth, original_work, alpha_mask, lum_threshold=dark_lum_threshold,
+            )
+            timings["dark_suppress"] = time.time() - t
+
+        # 4b2. Image-guided depth smoothing — additional edge-preserving cleanup
+        # within image-uniform regions; useful even after dark-region suppress.
+        if depth_smooth_radius_px > 0:
+            t = time.time()
+            radius = max(1, int(depth_smooth_radius_px *
+                                (max(depth.shape) / 1080.0)))
+            depth = self._image_guided_depth_smooth(
+                depth, original_work, radius_px=radius, eps=depth_smooth_eps,
+            )
+            timings["depth_smooth"] = time.time() - t
+
         # 4c. Silhouette-edge depth feather — anti-icicle, depth-domain.
         # Within edge_px of the boundary, blend toward heavy-gaussian smoothed
         # depth so noisy boundary pixels can't form sawtooth z spikes.
@@ -423,7 +577,9 @@ class Model:
             )
             timings["silhouette_cut"] = time.time() - t
 
-        # 7. Reorient upright (Y-up, looking down −Z).
+        # 7. Reorient: -90° about X with z-flipped depth (foreground at +Z
+        # pre-rotation). After rotation: head at -Z (top of screen), face at
+        # +Y (toward camera at +Y in user's editor), right at +X.
         mesh.apply_transform(transformations.rotation_matrix(np.radians(-90), [1, 0, 0]))
 
         # 8. Export.
@@ -464,10 +620,14 @@ def generate_3d(item: dict, authorization: str = fastapi.Header(None)):
             image_data,
             keep_background=bool(item.get("keep_background", False)),
             depth_ratio=float(item.get("depth_ratio", 0.30)),
-            alpha_threshold=int(item.get("alpha_threshold", 160)),
-            silhouette_open_iters=int(item.get("silhouette_open_iters", 2)),
-            silhouette_erode_iters=int(item.get("silhouette_erode_iters", 2)),
+            alpha_threshold=int(item.get("alpha_threshold", 128)),
+            silhouette_open_iters=int(item.get("silhouette_open_iters", 0)),
+            silhouette_erode_iters=int(item.get("silhouette_erode_iters", 0)),
             silhouette_edge_smooth_px=float(item.get("silhouette_edge_smooth_px", 12.0)),
+            alpha_smooth_sigma_px=float(item.get("alpha_smooth_sigma_px", 4.0)),
+            depth_smooth_radius_px=float(item.get("depth_smooth_radius_px", 8.0)),
+            depth_smooth_eps=float(item.get("depth_smooth_eps", 0.01)),
+            dark_lum_threshold=float(item.get("dark_lum_threshold", 0.30)),
         )
     except Exception as e:
         import traceback
